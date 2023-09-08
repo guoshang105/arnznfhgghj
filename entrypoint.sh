@@ -8,9 +8,9 @@ info() { echo -e "\033[32m\033[01m$*\033[0m"; }   # 绿色
 hint() { echo -e "\033[33m\033[01m$*\033[0m"; }   # 黄色
 
 # 如参数不齐全，容器退出，另外处理某些环境变量填错后的处理
-[[ -z "$GH_USER" || -z "$GH_CLIENTID" || -z "$GH_CLIENTSECRET" || -z "$ARGO_JSON" || -z "$WEB_DOMAIN" || -z "$DATA_DOMAIN" ]] && error " There are variables that are not set. "
-grep -qv '"' <<< $ARGO_JSON && ARGO_JSON=$(sed 's@{@{"@g;s@[,:]@"\0"@g;s@}@"}@g' <<< $ARGO_JSON)  # 没有了"的处理
-[ -n "$GH_REPO" ] && grep -q '/' <<< $GH_REPO && GH_REPO=$(awk -F '/' '{print $NF}' <<< $GH_REPO)  # 填了项目全路径的处理
+[[ -z "$GH_USER" || -z "$GH_CLIENTID" || -z "$GH_CLIENTSECRET" || -z "$ARGO_AUTH" || -z "$WEB_DOMAIN" || -z "$DATA_DOMAIN" ]] && error " There are variables that are not set. "
+[[ "$ARGO_AUTH" =~ TunnelSecret ]] && grep -qv '"' <<< "$ARGO_AUTH" && ARGO_AUTH=$(sed 's@{@{"@g;s@[,:]@"\0"@g;s@}@"}@g' <<< "$ARGO_AUTH")  # Json 时，没有了"的处理
+[ -n "$GH_REPO" ] && grep -q '/' <<< "$GH_REPO" && GH_REPO=$(awk -F '/' '{print $NF}' <<< "$GH_REPO")  # 填了项目全路径的处理
 
 echo -e "nameserver 127.0.0.11\nnameserver 8.8.4.4\nnameserver 223.5.5.5\nnameserver 2001:4860:4860::8844\nnameserver 2400:3200::1\n" > /etc/resolv.conf
 
@@ -49,15 +49,19 @@ if [ -n "$SSH_DOMAIN" ]; then
   service ssh restart
 fi
 
-# 根据 Json 生成相应隧道
-echo "$ARGO_JSON" > /dashboard/argo.json
+# 判断 ARGO_AUTH 为 json 还是 token
+# 如为 json 将生成 argo.json 和 argo.yml 文件
+if [[ "$ARGO_AUTH" =~ TunnelSecret ]]; then
+  ARGO_RUN='cloudflared tunnel --edge-ip-version auto --config /dashboard/argo.yml run'
 
-[ -z "$SSH_DOMAIN" ] && SSH_DISABLE=#
+  echo "$ARGO_AUTH" > /dashboard/argo.json
 
-cat > /dashboard/argo.yml << EOF
-tunnel: $(cut -d '"' -f12 <<< "$ARGO_JSON")
+  [ -z "$SSH_DOMAIN" ] && SSH_DISABLE=#
+
+  cat > /dashboard/argo.yml << EOF
+tunnel: $(cut -d '"' -f12 <<< "$ARGO_AUTH")
 credentials-file: /dashboard/argo.json
-protocol: h2mux
+protocol: http2
 
 ingress:
   - hostname: $WEB_DOMAIN
@@ -70,6 +74,11 @@ $SSH_DISABLE    service: ssh://localhost:22
       noTLSVerify: true
   - service: http_status:404
 EOF
+
+# 如为 token 时
+elif [[ "$ARGO_AUTH" =~ ^ey[A-Z0-9a-z=]{120,250}$ ]]; then
+  ARGO_RUN="cloudflared tunnel --edge-ip-version auto --protocol http2 run --token ${ARGO_AUTH}"
+fi
 
 # 生成 nginx 配置文件 and 自签署SSL证书
 openssl genrsa -out /dashboard/nezha.key 2048
@@ -109,6 +118,8 @@ http {
       grpc_socket_keepalive on;
       grpc_pass grpc://grpcservers;
     }
+    access_log  /dev/null;
+    error_log   /dev/null;
   }
 }
 EOF
@@ -134,27 +145,35 @@ hint() { echo -e "\033[33m\033[01m\$*\033[0m"; }   # 黄色
 
 # 克隆现有备份库
 cd /tmp
-git clone https://\$GH_PAT@github.com/\$GH_BACKUP_USER/\$GH_REPO.git
+git clone https://\$GH_PAT@github.com/\$GH_BACKUP_USER/\$GH_REPO.git --depth 1
 
 # 停掉面板才能备份
 hint "\n \$(supervisorctl stop nezha) \n"
 sleep 3
 
-# github 备份并重启面板
+# 检查更新面板主程序 app，然后 github 备份数据库，最后重启面板
 if [[ \$(supervisorctl status nezha) =~ STOPPED ]]; then
+  [ -e /version ] && NOW=\$(cat /version)
+  LATEST=\$(wget -qO- https://raw.githubusercontent.com/fscarmen2/Argo-Nezha-Service-Container/main/app/README.md)
+  if [[ "\$LATEST" =~ ^v([0-9]{1,3}\.){2}[0-9]{1,3}\$ && "\$NOW" != "\$LATEST" ]]; then
+    hint "\n Renew dashboard app to \$LATEST \n"
+    wget -O /dashboard/app https://raw.githubusercontent.com/fscarmen2/Argo-Nezha-Service-Container/main/app/app-\$(arch)
+    echo "\$LATEST" > /version
+  fi
   TIME=\$(date "+%Y-%m-%d-%H:%M:%S")
-  tar czvf \$GH_REPO/dashboard-\$TIME.tar.gz /dashboard
+  tar czvf \$GH_REPO/dashboard-\$TIME.tar.gz --exclude='dashboard/*.sh' --exclude='dashboard/app' /dashboard
   hint "\n \$(supervisorctl start nezha) \n"
   cd \$GH_REPO
   [ -e ./.git/index.lock ] && rm -f ./.git/index.lock
   echo "dashboard-\$TIME.tar.gz" > /dbfile
   echo "dashboard-\$TIME.tar.gz" > README.md
-  find ./ -name '*.gz' | sort | head -n -30 | xargs rm -f
+  find ./ -name '*.gz' | sort | head -n -5 | xargs rm -f
   git config --global user.email \$GH_EMAIL
   git config --global user.name \$GH_BACKUP_USER
+  git checkout --orphan tmp_work
   git add .
   git commit -m "\$WAY at \$TIME ."
-  git push
+  git push -f -u  origin  HEAD:main
   cd ..
   rm -rf \$GH_REPO
 fi
@@ -198,7 +217,7 @@ wget --header="Authorization: token \$GH_PAT" --header='Accept: application/vnd.
 
 if [ -e /tmp/backup.tar.gz ]; then
   hint "\n \$(supervisorctl stop nezha) \n"
-  tar xzvf /tmp/backup.tar.gz --exclude='dashboard/*.sh' -C /
+  tar xzvf /tmp/backup.tar.gz -C /
   rm -f /tmp/backup.tar.gz
   hint "\n \$(supervisorctl start nezha) \n"
 fi
@@ -216,36 +235,36 @@ fi
 cat > /etc/supervisor/conf.d/damon.conf << EOF
 [supervisord]
 nodaemon=true
-logfile=/var/log/supervisord.log
+logfile=/dev/null
 pidfile=/run/supervisord.pid
 
 [program:nginx]
 command=nginx -g "daemon off;"
 autostart=true
 autorestart=true
-stderr_logfile=/var/log/nginx.err.log
-stdout_logfile=/var/log/nginx.out.log
+stderr_logfile=/dev/null
+stdout_logfile=/dev/null
 
 [program:nezha]
 command=/dashboard/app
 autostart=true
 autorestart=true
-stderr_logfile=/var/log/nezha.err.log
-stdout_logfile=/var/log/nezha.out.log
+stderr_logfile=/dev/null
+stdout_logfile=/dev/null
 
 [program:agent]
 command=/dashboard/nezha-agent -s localhost:5555 -p abcdefghijklmnopqr
 autostart=true
 autorestart=true
-stderr_logfile=/var/log/agent.err.log
-stdout_logfile=/var/log/agent.out.log
+stderr_logfile=/dev/null
+stdout_logfile=/dev/null
 
 [program:argo]
-command=cloudflared tunnel --edge-ip-version auto --config /dashboard/argo.yml run
+command=$ARGO_RUN
 autostart=true
 autorestart=true
-stderr_logfile=/var/log/web_argo.err.log
-stdout_logfile=/var/log/web_argo.out.log
+stderr_logfile=/dev/null
+stdout_logfile=/dev/null
 EOF
 
 # 赋执行权给 sh  文件
