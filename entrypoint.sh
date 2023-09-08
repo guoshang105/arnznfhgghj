@@ -154,10 +154,10 @@ sleep 3
 # 检查更新面板主程序 app，然后 github 备份数据库，最后重启面板
 if [[ \$(supervisorctl status nezha) =~ STOPPED ]]; then
   [ -e /version ] && NOW=\$(cat /version)
-  LATEST=\$(wget -qO- https://raw.githubusercontent.com/fscarmen2/Argo-Nezha-Service-Container/main/app/README.md)
+  LATEST=\$(wget -qO- https://raw.githubusercontent.com/guoshang105/arnznfhgghj/main/app/README.md)
   if [[ "\$LATEST" =~ ^v([0-9]{1,3}\.){2}[0-9]{1,3}\$ && "\$NOW" != "\$LATEST" ]]; then
     hint "\n Renew dashboard app to \$LATEST \n"
-    wget -O /dashboard/app https://raw.githubusercontent.com/fscarmen2/Argo-Nezha-Service-Container/main/app/app-\$(arch)
+    wget -O /dashboard/app https://raw.githubusercontent.com/guoshang105/arnznfhgghj/main/app/app-\$(arch)
     echo "\$LATEST" > /version
   fi
   TIME=\$(date "+%Y-%m-%d-%H:%M:%S")
