@@ -14,7 +14,7 @@ RUN apt-get update &&\
     unzip nezha-agent.zip -d /usr/local/bin &&\
     wget -O cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$(uname -m | sed "s#x86_64#amd64#; s#aarch64#arm64#").deb &&\
     dpkg -i cloudflared.deb &&\
-    wget -O grpcwebproxy.tar.gz https://github.com/guoshang105/arnznfhgghj/releases/download/grpcwebproxy/grpcwebproxy_linux_$(uname -m | sed "s#x86_64#amd64#; s#aarch64#arm64#").tar.gz &&\
+    wget -O grpcwebproxy.tar.gz https://github.com/fscarmen2/Argo-Nezha-Service-Container/releases/download/grpcwebproxy/grpcwebproxy_linux_$(uname -m | sed "s#x86_64#amd64#; s#aarch64#arm64#").tar.gz &&\
     tar xzvf grpcwebproxy.tar.gz -C /usr/local/bin &&\
     rm -f nezha-agent.zip grpcwebproxy.tar.gz cloudflared.deb &&\
     touch /dbfile &&\
