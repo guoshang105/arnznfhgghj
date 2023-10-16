@@ -71,6 +71,7 @@ $SSH_DISABLE    service: ssh://localhost:22
   - hostname: $DATA_DOMAIN
     service: https://localhost:443
     originRequest:
+      http2Origin: true
       noTLSVerify: true
   - service: http_status:404
 EOF
@@ -80,49 +81,10 @@ elif [[ "$ARGO_AUTH" =~ ^ey[A-Z0-9a-z=]{120,250}$ ]]; then
   ARGO_RUN="cloudflared tunnel --edge-ip-version auto --protocol http2 run --token ${ARGO_AUTH}"
 fi
 
-# 生成 nginx 配置文件 and 自签署SSL证书
+# 生成自签署SSL证书
 openssl genrsa -out /dashboard/nezha.key 2048
 openssl req -new -subj "/CN=$DATA_DOMAIN" -key nezha.key -out /dashboard/nezha.csr
 openssl x509 -req -days 36500 -in /dashboard/nezha.csr -signkey /dashboard/nezha.key -out /dashboard/nezha.pem
-
-cat > /etc/nginx/nginx.conf  << EOF
-user www-data;
-worker_processes auto;
-pid /run/nginx.pid;
-include /etc/nginx/modules-enabled/*.conf;
-
-events {
-        worker_connections 768;
-        # multi_accept on;
-}
-
-http {
-  upstream grpcservers {
-    server localhost:5555;
-    keepalive 1024;
-  }
-
-  server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name $DATA_DOMAIN;
-
-    ssl_certificate          /dashboard/nezha.pem;
-    ssl_certificate_key      /dashboard/nezha.key;
-
-    underscores_in_headers on;
-
-    location / {
-      grpc_read_timeout 300s;
-      grpc_send_timeout 300s;
-      grpc_socket_keepalive on;
-      grpc_pass grpc://grpcservers;
-    }
-    access_log  /dev/null;
-    error_log   /dev/null;
-  }
-}
-EOF
 
 # 生成备份和恢复脚本
 if [[ -n "$GH_BACKUP_USER" && -n "$GH_EMAIL" && -n "$GH_REPO" && -n "$GH_PAT" ]]; then
@@ -139,13 +101,18 @@ error() { echo -e "\033[31m\033[01m\$*\033[0m" && exit 1; } # 红色
 info() { echo -e "\033[32m\033[01m\$*\033[0m"; }   # 绿色
 hint() { echo -e "\033[33m\033[01m\$*\033[0m"; }   # 黄色
 
-[ "\$(wget -qO- --header="Authorization: token \$GH_PAT" https://api.github.com/repos/\$GH_BACKUP_USER/\$GH_REPO | grep -oPm1 '(?<="private": ).*(?=,)')" != true ] && error "\n This is not exist nor a private repository and the script exits. \n"
+IS_PRIVATE="\$(wget -qO- --header="Authorization: token \$GH_PAT" https://api.github.com/repos/\$GH_BACKUP_USER/\$GH_REPO | grep -oPm1 '(?<="private": ).*(?=,)')"
+if [ "\$?" != 0 ]; then
+  error "\n Could not connect to Github. Stop backup. \n"
+elif [ "\$IS_PRIVATE" != true ]; then
+  error "\n This is not exist nor a private repository and the script exits. \n"
+fi
 
 [ -n "\$1" ] && WAY=Scheduled || WAY=Manualed
 
 # 停掉面板才能备份
-hint "\n\$(supervisorctl stop agent nezha nginx)\n"
-sleep 3
+hint "\n\$(supervisorctl stop agent nezha grpcwebproxy)\n"
+sleep 2
 
 # 克隆现有备份库
 cd /tmp
@@ -161,10 +128,9 @@ if [[ \$(supervisorctl status nezha) =~ STOPPED ]]; then
     echo "\$LATEST" > /version
   fi
   TIME=\$(date "+%Y-%m-%d-%H:%M:%S")
-  tar czvf \$GH_REPO/dashboard-\$TIME.tar.gz --exclude='dashboard/*.sh' --exclude='dashboard/app' --exclude='dashboard/nezha-agent' /dashboard
+  tar czvf \$GH_REPO/dashboard-\$TIME.tar.gz --exclude='dashboard/*.sh' --exclude='dashboard/app' --exclude='dashboard/argo.*' --exclude='dashboard/nezha.*' /dashboard
   cd \$GH_REPO
   [ -e ./.git/index.lock ] && rm -f ./.git/index.lock
-  echo "dashboard-\$TIME.tar.gz" > /dbfile
   echo "dashboard-\$TIME.tar.gz" > README.md
   find ./ -name '*.gz' | sort | head -n -5 | xargs rm -f
   git config --global user.email \$GH_EMAIL
@@ -173,9 +139,11 @@ if [[ \$(supervisorctl status nezha) =~ STOPPED ]]; then
   git add .
   git commit -m "\$WAY at \$TIME ."
   git push -f -u origin HEAD:main --quiet
+  IS_BACKUP="\$?"
   cd ..
   rm -rf \$GH_REPO
-  hint "\n\$(supervisorctl start agent nezha nginx)\n"; sleep 30
+  [ "\$IS_BACKUP" = 0 ] && echo "dashboard-\$TIME.tar.gz" > /dbfile && info "\n Succeed to upload the backup files dashboard-\$TIME.tar.gz to Github.\n" || hint "\n Failed to upload the backup files dashboard-\$TIME.tar.gz to Github.\n"
+  hint "\n\$(supervisorctl start agent nezha grpcwebproxy)\n"; sleep 2
 fi
 
 [ \$(supervisorctl status all | grep -c "RUNNING") = \$(grep -c '\[program:.*\]' /etc/supervisor/conf.d/damon.conf) ] && info "\n Done! \n" || error "\n Fail! \n"
@@ -216,14 +184,15 @@ DOWNLOAD_URL=https://raw.githubusercontent.com/\$GH_BACKUP_USER/\$GH_REPO/main/\
 wget --header="Authorization: token \$GH_PAT" --header='Accept: application/vnd.github.v3.raw' -O /tmp/backup.tar.gz "\$DOWNLOAD_URL"
 
 if [ -e /tmp/backup.tar.gz ]; then
-  hint "\n\$(supervisorctl stop agent nezha nginx)\n"
+  hint "\n\$(supervisorctl stop agent nezha grpcwebproxy)\n"
   FILE_LIST=\$(tar -tzf /tmp/backup.tar.gz)
   grep -q "dashboard/app" <<< "\$FILE_LIST" && EXCLUDE[0]=--exclude='dashboard/app'
   grep -q "dashboard/.*\.sh" <<< "\$FILE_LIST" && EXCLUDE[1]=--exclude='dashboard/*.sh'
-  grep -q "dashboard/nezha-agent" <<< "\$FILE_LIST" && EXCLUDE[2]="--exclude='dashboard/nezha-agent'"
+  grep -q "dashboard/argo\..*" <<< "\$FILE_LIST" && EXCLUDE[2]=--exclude='dashboard/argo.*'
+  grep -q "dashboard/nezha\..*" <<< "\$FILE_LIST" && EXCLUDE[3]=--exclude='dashboard/nezha.*'
   tar xzvf /tmp/backup.tar.gz \${EXCLUDE[*]} -C /
   rm -f /tmp/backup.tar.gz
-  hint "\n\$(supervisorctl start agent nezha nginx)\n"; sleep 30
+  hint "\n\$(supervisorctl start agent nezha grpcwebproxy)\n"; sleep 2
 fi
 
 [ \$(supervisorctl status all | grep -c "RUNNING") = \$(grep -c '\[program:.*\]' /etc/supervisor/conf.d/damon.conf) ] && info "\n Done! \n" || error "\n Fail! \n"
@@ -242,8 +211,8 @@ nodaemon=true
 logfile=/dev/null
 pidfile=/run/supervisord.pid
 
-[program:nginx]
-command=nginx -g "daemon off;"
+[program:grpcwebproxy]
+command=grpcwebproxy --server_tls_cert_file=/dashboard/nezha.pem --server_tls_key_file=/dashboard/nezha.key --server_http_tls_port=443 --backend_addr=localhost:5555 --backend_tls_noverify --server_http_max_read_timeout=300s --server_http_max_write_timeout=300s
 autostart=true
 autorestart=true
 stderr_logfile=/dev/null
@@ -257,7 +226,7 @@ stderr_logfile=/dev/null
 stdout_logfile=/dev/null
 
 [program:agent]
-command=/dashboard/nezha-agent -s localhost:5555 -p abcdefghijklmnopqr
+command=nezha-agent -s localhost:5555 -p abcdefghijklmnopqr
 autostart=true
 autorestart=true
 stderr_logfile=/dev/null
